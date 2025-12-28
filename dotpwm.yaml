@@ -1,0 +1,158 @@
+esphome:
+  name: dotpwm
+  friendly_name: DIY Air Purifier
+  on_boot:
+    priority: -100
+    then:
+      - delay: 2s
+      - fan.turn_on:
+          id: purifier_fan
+          speed: !lambda 'return id(last_fan_speed);'
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+api:
+
+ota:
+
+wifi:
+  ssid: "Archer C20"
+  password: "ghanta@786"
+
+  ap:
+    ssid: "Dotpwm Fallback"
+    password: "82jNkVOU8RN1"
+
+captive_portal:
+
+web_server:
+  port: 80
+
+esp32_ble_server:
+
+# ---------------- POWER / STATE ----------------
+globals:
+  - id: last_fan_speed
+    type: int
+    restore_value: yes
+    initial_value: '60'
+
+# ---------------- I2C OLED ----------------
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  scan: true
+
+font:
+  - file: "arial.ttf"
+    id: font_small
+    size: 10
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    lambda: |-
+      it.printf(0, 0, id(font_small), "DIY AIR PURIFIER");
+      it.printf(0, 12, id(font_small),
+                "IP: %s", WiFi.localIP().toString().c_str());
+      it.printf(0, 24, id(font_small),
+                "Fan: %d%%", id(last_fan_speed));
+      it.printf(0, 36, id(font_small),
+                "RPM: %.0f", id(fan_rpm).state);
+      it.printf(0, 48, id(font_small),
+                "Up: %s", id(esp_uptime_text).state.c_str());
+
+# ---------------- PWM FAN ----------------
+output:
+  - platform: ledc
+    pin: GPIO25        # SAFE PWM PIN
+    frequency: 25000 Hz
+    id: fan_pwm
+
+fan:
+  - platform: speed
+    name: "Purifier Fan"
+    id: purifier_fan
+    output: fan_pwm
+    speed_count: 100
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_speed_set:
+      then:
+        - lambda: |-
+            id(last_fan_speed) = x;
+
+# ---------------- RPM SENSOR ----------------
+sensor:
+  - platform: pulse_counter
+    pin:
+      number: GPIO27
+      mode:
+        input: true
+    name: "Fan RPM"
+    id: fan_rpm
+    unit_of_measurement: "RPM"
+    update_interval: 2s
+    accuracy_decimals: 0
+    count_mode:
+      rising_edge: INCREMENT
+      falling_edge: DISABLE
+    filters:
+      - multiply: 0.5
+      - exponential_moving_average:
+          alpha: 0.4
+
+  - platform: uptime
+    name: "ESP Uptime (seconds)"
+    id: esp_uptime_sec
+    update_interval: 10s
+
+  - platform: template
+    name: "Fan Speed (%)"
+    accuracy_decimals: 0
+    lambda: |-
+      return id(last_fan_speed);
+    update_interval: 2s
+
+# ---------------- UPTIME TEXT ----------------
+text_sensor:
+  - platform: template
+    name: "ESP Uptime"
+    id: esp_uptime_text
+    update_interval: 10s
+    lambda: |-
+      int seconds = (int) id(esp_uptime_sec).state;
+      int h = seconds / 3600;
+      int m = (seconds % 3600) / 60;
+      int s = seconds % 60;
+      char buffer[16];
+      snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", h, m, s);
+      return std::string(buffer);
+
+# ---------------- PRESET BUTTONS ----------------
+button:
+  - platform: template
+    name: "Quiet"
+    on_press:
+      - fan.turn_on:
+          id: purifier_fan
+          speed: 25
+
+  - platform: template
+    name: "Normal"
+    on_press:
+      - fan.turn_on:
+          id: purifier_fan
+          speed: 60
+
+  - platform: template
+    name: "Max"
+    on_press:
+      - fan.turn_on:
+          id: purifier_fan
+          speed: 100
