@@ -12,7 +12,7 @@ esphome:
 esp32:
   board: esp32dev
   framework:
-    type: arduino
+    type: esp-idf
 
 logger:
 
@@ -28,12 +28,18 @@ wifi:
     ssid: "Dotpwm Fallback"
     password: "82jNkVOU8RN1"
 
+
 captive_portal:
 
 web_server:
   port: 80
 
 esp32_ble_server:
+
+interval:
+  - interval: 10s
+    then:
+      - component.update: oled_display
 
 # ---------------- POWER / STATE ----------------
 globals:
@@ -49,24 +55,30 @@ i2c:
   scan: true
 
 font:
-  - file: "arial.ttf"
+  - file: "roboto.ttf"
     id: font_small
     size: 10
 
 display:
   - platform: ssd1306_i2c
     model: "SSD1306 128x64"
+    id: oled_display
     address: 0x3C
     lambda: |-
       it.printf(0, 0, id(font_small), "DIY AIR PURIFIER");
-      it.printf(0, 12, id(font_small),
-                "IP: %s", WiFi.localIP().toString().c_str());
+      if (id(esp_ip).state == "") {
+        it.printf(0, 12, id(font_small),
+                "WIFI: Connecting...");
+      } else {
+        it.printf(0, 12, id(font_small),
+                "IP: %s", id(esp_ip).state.c_str());
+      }
       it.printf(0, 24, id(font_small),
-                "Fan: %d%%", id(last_fan_speed));
+                "FAN: %d%%", id(last_fan_speed));
       it.printf(0, 36, id(font_small),
                 "RPM: %.0f", id(fan_rpm).state);
       it.printf(0, 48, id(font_small),
-                "Up: %s", id(esp_uptime_text).state.c_str());
+                "UP TIME: %s", id(esp_uptime_text).state.c_str());
 
 # ---------------- PWM FAN ----------------
 output:
@@ -110,7 +122,7 @@ sensor:
   - platform: uptime
     name: "ESP Uptime (seconds)"
     id: esp_uptime_sec
-    update_interval: 10s
+    update_interval: 5s
 
   - platform: template
     name: "Fan Speed (%)"
@@ -119,12 +131,13 @@ sensor:
       return id(last_fan_speed);
     update_interval: 2s
 
-# ---------------- UPTIME TEXT ----------------
+
 text_sensor:
+# ---------------- UPTIME TEXT ----------------
   - platform: template
     name: "ESP Uptime"
     id: esp_uptime_text
-    update_interval: 10s
+    update_interval: 5s
     lambda: |-
       int seconds = (int) id(esp_uptime_sec).state;
       int h = seconds / 3600;
@@ -133,6 +146,12 @@ text_sensor:
       char buffer[16];
       snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", h, m, s);
       return std::string(buffer);
+# -------- WIFI INFO (CORRECT WAY) --------
+  - platform: wifi_info
+    ip_address:
+      id: esp_ip
+    ssid:
+      id: esp_ssid
 
 # ---------------- PRESET BUTTONS ----------------
 button:
