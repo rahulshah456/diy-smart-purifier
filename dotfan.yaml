@@ -1,0 +1,78 @@
+esphome:
+  name: dotpwm
+  friendly_name: DIY Purifier
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+# ---------------- CORE SERVICES ----------------
+logger:
+
+api:
+
+ota:
+
+wifi:
+  ssid: "Archer C20"
+  password: "ghanta@786"
+
+  ap:
+    ssid: "Dotpwm Fallback Hotspot"
+    password: "82jNkVOU8RN1"
+
+captive_portal:
+
+web_server:
+  port: 80
+
+# ---------------- PWM FAN CONTROL ----------------
+output:
+  - platform: ledc
+    pin: GPIO12            # SAFE PWM pin
+    frequency: 25000 Hz    # Intel PWM fan spec
+    inverted: true         # REQUIRED for 4-wire fans
+    id: fan_pwm
+
+fan:
+  - platform: speed
+    output: fan_pwm
+    name: "Purifier Fan"
+    id: purifier_fan
+    restore_mode: RESTORE_DEFAULT_ON
+    speed_count: 100       # 0–100% slider
+
+# ---------------- FAN RPM (TACH) ----------------
+sensor:
+  - platform: pulse_counter
+    pin: GPIO13            # SAFE interrupt pin
+    name: "Fan RPM"
+    unit_of_measurement: "RPM"
+    accuracy_decimals: 0
+    update_interval: 2s
+    filters:
+      - multiply: 30       # 2 pulses per revolution
+
+# ---------------- PRESET BUTTONS ----------------
+button:
+  - platform: template
+    name: "Quiet"
+    on_press:
+      - fan.turn_on:
+          id: purifier_fan
+          speed: 25
+
+  - platform: template
+    name: "Normal"
+    on_press:
+      - fan.turn_on:
+          id: purifier_fan
+          speed: 60
+
+  - platform: template
+    name: "Max"
+    on_press:
+      - fan.turn_on:
+          id: purifier_fan
+          speed: 100
