@@ -54,6 +54,10 @@ esphome run .\sensor_pwm_auto.yaml
 
 ---
 
+### Schematics
+<img width="1564" height="846" alt="schematics default" src="https://github.com/user-attachments/assets/ca60616b-848c-4f2f-a2e9-5eb35d1d18fa" />
+
+
 ## FAN CONNECTOR PINOUT
 
 | Wire Color | Function | Connection |
