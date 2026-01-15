@@ -1,0 +1,563 @@
+#================================================================================
+# DIY AIR PURIFIER — Automatic PM2.5 Version
+# ESPHome Configuration for ESP32 + PMS9003M Sensor
+#
+# Features:
+#   • PM2.5 laser sensor for real-time air quality monitoring
+#   • Four operating modes: QUIET / NORMAL / MAX / AUTO
+#   • Auto mode: dynamic fan speed based on PM2.5 levels (10-100%)
+#   • OLED display (128x64) showing uptime, mode, speed, PM2.5, WiFi
+#   • RGB LED strip shows air quality status in real-time
+#   • Web UI dropdown for mode selection with hardware sync
+#   • Physical button to cycle through modes
+#   • Persistent mode/speed storage (survives reboot)
+#   • Tested on real hardware ✓
+#
+# SETUP INSTRUCTIONS:
+#   1. Update WiFi credentials below (lines 87-91)
+#   2. Update OTA password if desired (line 119)
+#   3. Ensure GPIO wiring matches (see README.md)
+#   4. Run: esphome run .\sensor_pwm_auto.yaml
+#
+# GPIO CONFIGURATION:
+#   GPIO25  = PWM fan output
+#   GPIO27  = Fan RPM (tachometer)
+#   GPIO21  = I2C SDA (OLED display)
+#   GPIO22  = I2C SCL (OLED display)
+#   GPIO16  = UART RX (PM2.5 sensor)
+#   GPIO17  = UART TX (PM2.5 sensor)
+#   GPIO14  = Mode button (INPUT_PULLUP)
+#   GPIO13  = WS2812 RGB LED strip
+#
+#================================================================================
+
+esphome:
+  name: purifier_core
+  friendly_name: DIY Purifier Core
+  
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          ESP_LOGI("BOOT", "🔧 Restoring last mode...");
+          // Get saved mode and calculate appropriate speed
+          int mode = id(mode_index);
+          int speed = 25;
+          
+          switch(mode) {
+            case 0: speed = 25;  break;  // QUIET
+            case 1: speed = 60;  break;  // NORMAL
+            case 2: speed = 100; break;  // MAX
+            case 3: speed = 25;  break;  // AUTO (starts at 25%)
+          }
+          
+          // Update display variables
+          id(display_speed) = speed;
+          const char* mode_names[] = {"QUIET", "NORMAL", "MAX", "AUTO"};
+          id(display_mode) = std::string(mode_names[mode]);
+          
+          // Apply fan speed
+          auto call = id(purifier_fan).make_call();
+          call.set_speed(speed);
+          call.perform();
+  
+  # Update uptime every loop cycle (continuous refresh)
+  on_loop:
+    then:
+      - lambda: |-
+          uint32_t uptime_sec = millis() / 1000;
+          id(display_uptime_hours) = uptime_sec / 3600;
+          id(display_uptime_minutes) = (uptime_sec % 3600) / 60;
+          id(display_uptime_seconds) = uptime_sec % 60;
+
+#================================================================================
+# ESP32 HARDWARE CONFIGURATION
+#================================================================================
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+  logs:
+    pmsx003: ERROR  # Suppress UART sync warnings (data is valid)
+
+#================================================================================
+# CONNECTIVITY: WiFi, Web Server, OTA Updates
+# ⚠️ UPDATE WiFi CREDENTIALS BEFORE FLASHING
+#================================================================================
+
+wifi:
+  ssid: "<your_wifi_ssid>"           # ← Change to your WiFi network name
+  password: "<your_wifi_password>"        # ← Change to your WiFi password
+  
+  # Fallback AP for configuration (if main WiFi unavailable)
+  ap:
+    ssid: "Dotpwm Fallback"
+    password: "82jNkVOU8RN1"   # ← Optional: change if desired
+  
+  # Handle WiFi connection events
+  on_connect:
+    then:
+      - lambda: |-
+          auto addresses = wifi::global_wifi_component->get_ip_addresses();
+          if (!addresses.empty()) {
+            id(display_wifi_ip) = addresses[0].str();
+          } else {
+            id(display_wifi_ip) = "Connecting...";
+          }
+          ESP_LOGI("WIFI", "✓ Connected: %s", id(display_wifi_ip).c_str());
+  
+  on_disconnect:
+    then:
+      - lambda: |-
+          id(display_wifi_ip) = "Connecting...";
+          ESP_LOGI("WIFI", "✗ Disconnected");
+
+web_server:
+  port: 80
+
+api:
+
+ota:
+  platform: esphome
+  password: "<your_ota_password>"          # ← Change for security! Used for OTA updates
+  # To update over-the-air after first flash:
+  # esphome run .\sensor_pwm_auto.yaml --device <DEVICE_IP>
+
+#================================================================================
+# GLOBAL VARIABLES - Synchronized between hardware, display, and web UI
+#================================================================================
+
+globals:
+  # Mode state (persisted across reboots)
+  - id: mode_index
+    type: int
+    restore_value: yes
+    initial_value: '0'  # 0=QUIET, 1=NORMAL, 2=MAX, 3=AUTO
+  
+  # Display uptime components (HH:MM:SS format)
+  - id: display_uptime_hours
+    type: int
+    initial_value: '0'
+  
+  - id: display_uptime_minutes
+    type: int
+    initial_value: '0'
+  
+  - id: display_uptime_seconds
+    type: int
+    initial_value: '0'
+  
+  # Display mode name (for OLED and sync)
+  - id: display_mode
+    type: std::string
+    initial_value: '"QUIET"'
+  
+  # Display fan speed percentage (for OLED and web UI)
+  - id: display_speed
+    type: int
+    initial_value: '0'
+  
+  # Latest PM2.5 reading (updated from sensor every 30s)
+  - id: display_pm25
+    type: float
+    initial_value: '0.0'
+  
+  # WiFi status for display (IP or "Connecting...")
+  - id: display_wifi_ip
+    type: std::string
+    initial_value: '"Connecting..."'
+  
+  # Air quality status (Good/Fair/Moderate/Poor/Very Poor/Severe)
+  - id: aqi_status
+    type: std::string
+    initial_value: '"Good"'
+  
+  # LED strip on/off state tracker
+  - id: aqi_led_on
+    type: bool
+    initial_value: 'true'
+
+#================================================================================
+# UART COMMUNICATION - PMS9003M Particle Sensor
+#================================================================================
+
+uart:
+  id: pms_uart
+  rx_pin: GPIO16  # Sensor TX → ESP32 RX
+  tx_pin: GPIO17  # ESP32 TX → Sensor RX
+  baud_rate: 9600
+  stop_bits: 1
+  data_bits: 8
+  parity: NONE
+
+#================================================================================
+# SENSORS - Air Quality, RPM, Uptime
+#================================================================================
+
+sensor:
+  # System uptime sensor (base sensor for calculations)
+  - platform: uptime
+    name: "Uptime (seconds)"
+    id: uptime_sensor
+    unit_of_measurement: "s"
+    update_interval: 10s
+  
+  # Fan RPM measurement via pulse counter
+  - platform: pulse_counter
+    pin: GPIO27
+    name: "Fan RPM"
+    id: fan_rpm
+    update_interval: 3s
+    filters:
+      - multiply: 0.5  # Adjust multiplier based on fan pulses-per-revolution
+  
+  # PMS9003M Air Quality Sensor (via UART)
+  - platform: pmsx003
+    type: PMSX003
+    uart_id: pms_uart
+    update_interval: 30s
+    
+    # PM1.0 - Particulate Matter 1.0 microns
+    pm_1_0:
+      name: "PM1.0"
+      id: pm10
+      on_value:
+        then:
+          - lambda: |-
+              ESP_LOGI("PM10", "PM1.0=%.1f ug/m3", x);
+    
+    # PM2.5 - Primary sensor for auto mode control
+    pm_2_5:
+      name: "PM2.5"
+      id: pm25
+      on_value:
+        then:
+          - lambda: |-
+              float pm = x;
+              id(display_pm25) = pm;
+              ESP_LOGI("PM25", "PM2.5=%.1f ug/m3", pm);
+              
+              // Only apply AUTO mode logic if in AUTO mode (mode_index == 3)
+              if (id(mode_index) != 3) return;
+              
+              // Calculate fan speed based on PM2.5 levels (AUTO mode)
+              int speed = 10;
+              if (pm <= 3) speed = 10;
+              else if (pm <= 6) speed = 20;
+              else if (pm <= 9) speed = 30;
+              else if (pm <= 18) speed = 40;
+              else if (pm <= 30) speed = 55;
+              else if (pm <= 40) speed = 70;
+              else if (pm <= 54) speed = 85;
+              else if (pm <= 75) speed = 90;
+              else if (pm <= 99) speed = 95;
+              else speed = 100;
+              
+              id(display_speed) = speed;
+              ESP_LOGI("AUTO", "PM2.5=%.1f → Auto Fan Speed: %d%%", pm, speed);
+              
+              // Apply fan speed
+              auto call = id(purifier_fan).make_call();
+              call.set_speed(speed);
+              call.perform();
+              
+              // Update LED color based on PM2.5 levels
+              auto c = Color(0,255,0);  // Default: Green (Good)
+              if (pm > 6) c = Color(0,255,255);    // Cyan (Fair)
+              if (pm > 9) c = Color(255,255,0);    // Yellow (Moderate)
+              if (pm > 18) c = Color(255,165,0);   // Orange (Unhealthy for Sensitive)
+              if (pm > 30) c = Color(255,0,0);     // Red (Unhealthy)
+              if (pm > 54) c = Color(139,0,0);     // Dark Red (Very Unhealthy)
+              if (pm > 75) c = Color(128,0,128);   // Purple (Hazardous)
+              if (pm > 99) c = Color(255,20,147);  // Pink (Emergency)
+              
+              id(aqi_led).turn_on().set_rgb(c.red/255.0, c.green/255.0, c.blue/255.0);
+              
+              // Set AQI Status text
+              if (pm <= 3) id(aqi_status) = "Good";
+              else if (pm <= 6) id(aqi_status) = "Good";
+              else if (pm <= 9) id(aqi_status) = "Fair";
+              else if (pm <= 18) id(aqi_status) = "Fair";
+              else if (pm <= 30) id(aqi_status) = "Moderate";
+              else if (pm <= 40) id(aqi_status) = "Moderate";
+              else if (pm <= 54) id(aqi_status) = "Poor";
+              else if (pm <= 75) id(aqi_status) = "Poor";
+              else if (pm <= 99) id(aqi_status) = "Very Poor";
+              else id(aqi_status) = "Severe";
+    
+    # PM10.0 - Particulate Matter 10.0 microns
+    pm_10_0:
+      name: "PM10.0"
+      id: pm100
+      on_value:
+        then:
+          - lambda: |-
+              ESP_LOGI("PM100", "PM10.0=%.1f ug/m3", x);
+    
+    # Particle Count sensors (0.3μm to 10.0μm)
+    pm_0_3um:
+      name: "Particles 0.3μm (count)"
+      id: pm_count_03
+      unit_of_measurement: "per liter"
+      on_value:
+        then:
+          - lambda: |-
+              ESP_LOGI("PARTICLE", "0.3μm: %.0f particles/L", x);
+    
+    pm_0_5um:
+      name: "Particles 0.5μm (count)"
+      id: pm_count_05
+      unit_of_measurement: "per liter"
+      on_value:
+        then:
+          - lambda: |-
+              ESP_LOGI("PARTICLE", "0.5μm: %.0f particles/L", x);
+    
+    pm_1_0um:
+      name: "Particles 1.0μm (count)"
+      id: pm_count_10
+      unit_of_measurement: "per liter"
+      on_value:
+        then:
+          - lambda: |-
+              ESP_LOGI("PARTICLE", "1.0μm: %.0f particles/L", x);
+    
+    pm_2_5um:
+      name: "Particles 2.5μm (count)"
+      id: pm_count_25
+      unit_of_measurement: "per liter"
+      on_value:
+        then:
+          - lambda: |-
+              ESP_LOGI("PARTICLE", "2.5μm: %.0f particles/L", x);
+    
+    pm_5_0um:
+      name: "Particles 5.0μm (count)"
+      id: pm_count_50
+      unit_of_measurement: "per liter"
+      on_value:
+        then:
+          - lambda: |-
+              ESP_LOGI("PARTICLE", "5.0μm: %.0f particles/L", x);
+    
+    pm_10_0um:
+      name: "Particles 10.0μm (count)"
+      id: pm_count_100
+      unit_of_measurement: "per liter"
+      on_value:
+        then:
+          - lambda: |-
+              ESP_LOGI("PARTICLE", "10.0μm: %.0f particles/L", x);
+
+#================================================================================
+# OUTPUT CONTROL - Fan PWM
+#================================================================================
+
+output:
+  - platform: ledc
+    pin: GPIO25
+    frequency: 25000 Hz
+    id: fan_pwm
+
+fan:
+  - platform: speed
+    id: purifier_fan
+    name: "Purifier Fan"
+    output: fan_pwm
+    internal: true  # Hidden from web UI (controlled via mode select)
+    restore_mode: RESTORE_DEFAULT_ON
+
+#================================================================================
+# LIGHTING - WS2812 RGB LED Strip (Air Quality Indicator)
+#================================================================================
+
+light:
+  - platform: neopixelbus
+    variant: WS2812X
+    type: GRB
+    pin: GPIO13
+    num_leds: 8
+    id: aqi_led
+    name: "AQI Color"  # Shows real-time color based on air quality
+
+#================================================================================
+# I2C & DISPLAY - SSD1306 OLED Screen
+#================================================================================
+
+i2c:
+  id: i2c_bus
+  sda: GPIO21
+  scl: GPIO22
+  frequency: 100kHz
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 10
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    i2c_id: i2c_bus
+    update_interval: 2s  # Update every 2 seconds to save resources
+    lambda: |-
+      it.fill(Color::BLACK);
+      
+      // Line 0: Uptime (HH:MM:SS)
+      it.printf(0, 0, id(font_small), "Up Time: %02d:%02d:%02d", 
+        id(display_uptime_hours), id(display_uptime_minutes), id(display_uptime_seconds));
+      
+      // Line 1: Current mode
+      it.printf(0, 12, id(font_small), "Mode: %s", id(display_mode).c_str());
+      
+      // Line 2: Fan speed and RPM
+      if (id(fan_rpm).has_state()) {
+        it.printf(0, 24, id(font_small), "Speed: %d%%  |  %.0f RPM", 
+          id(display_speed), id(fan_rpm).state);
+      } else {
+        it.printf(0, 24, id(font_small), "Speed: %d%%  |  -- RPM", id(display_speed));
+      }
+      
+      // Line 3: PM2.5 air quality
+      it.printf(0, 36, id(font_small), "PM25: %.0f ug/m3", id(display_pm25));
+      
+      // Line 4: WiFi IP address
+      it.printf(0, 48, id(font_small), "WIFI: %s", id(display_wifi_ip).c_str());
+
+#================================================================================
+# CONTROL INTERFACE - Mode Selection (Web UI Dropdown)
+#================================================================================
+
+select:
+  - platform: template
+    name: "Purifier Mode"
+    id: purifier_mode_select
+    options:
+      - QUIET      # Low speed (25%), quiet operation
+      - NORMAL     # Medium speed (60%), balanced
+      - MAX        # High speed (100%), maximum cleaning
+      - AUTO       # Dynamic speed based on PM2.5 readings
+    # Always display the actual mode from hardware
+    lambda: |-
+      const char* mode_names[] = {"QUIET", "NORMAL", "MAX", "AUTO"};
+      return std::string(mode_names[id(mode_index)]);
+    set_action:
+      - lambda: |-
+          const char* mode_names[] = {"QUIET", "NORMAL", "MAX", "AUTO"};
+          
+          // Map selection to mode index
+          if (x == "QUIET") id(mode_index) = 0;
+          else if (x == "NORMAL") id(mode_index) = 1;
+          else if (x == "MAX") id(mode_index) = 2;
+          else id(mode_index) = 3;
+          
+          // Update display
+          id(display_mode) = std::string(mode_names[id(mode_index)]);
+          ESP_LOGI("MODE", "🔄 Mode changed → %s", x.c_str());
+          
+          // Calculate and apply speed for selected mode
+          int mode = id(mode_index);
+          int speed = (mode == 0) ? 25 : (mode == 1) ? 60 : (mode == 2) ? 100 : 25;
+          id(display_speed) = speed;
+          
+          auto call = id(purifier_fan).make_call();
+          call.set_speed(speed);
+          call.perform();
+
+#================================================================================
+# SWITCHES - LED Control
+#================================================================================
+
+switch:
+  - platform: template
+    name: "AQI LED Off"
+    id: aqi_led_switch
+    lambda: |-
+      return id(aqi_led_on);
+    turn_on_action:
+      - lambda: |-
+          id(aqi_led_on) = true;
+          ESP_LOGI("LED", "LED strip: ON");
+      - light.turn_on: aqi_led
+    turn_off_action:
+      - lambda: |-
+          id(aqi_led_on) = false;
+          ESP_LOGI("LED", "LED strip: OFF");
+      - light.turn_off: aqi_led
+
+#================================================================================
+# TEXT SENSORS - Status Display (Web UI)
+#================================================================================
+
+text_sensor:
+  # Air quality status indicator
+  - platform: template
+    name: "AQI Status"
+    id: aqi_status_sensor
+    lambda: |-
+      return id(aqi_status);
+    update_interval: 30s
+  
+  # Formatted uptime display (HH:MM:SS)
+  - platform: template
+    name: "Uptime"
+    id: uptime_display
+    lambda: |-
+      uint32_t uptime_sec = id(uptime_sensor).state;
+      int hours = uptime_sec / 3600;
+      int minutes = (uptime_sec % 3600) / 60;
+      int seconds = uptime_sec % 60;
+      char buffer[20];
+      snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", hours, minutes, seconds);
+      return std::string(buffer);
+    update_interval: 10s
+
+#================================================================================
+# BINARY SENSORS - Physical Controls (Hardware Button)
+#================================================================================
+
+binary_sensor:
+  # Mode button cycles through modes: QUIET → NORMAL → MAX → AUTO → QUIET
+  - platform: gpio
+    pin:
+      number: GPIO14
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Mode Button"
+    on_press:
+      then:
+        - lambda: |-
+            const char* mode_names[] = {"QUIET", "NORMAL", "MAX", "AUTO"};
+            
+            // Cycle to next mode
+            id(mode_index) = (id(mode_index) + 1) % 4;
+            id(display_mode) = std::string(mode_names[id(mode_index)]);
+            
+            ESP_LOGI("BUTTON", "🔘 Mode button pressed → %s", mode_names[id(mode_index)]);
+            
+            // Apply speed for new mode
+            int mode = id(mode_index);
+            int speed = (mode == 0) ? 25 : (mode == 1) ? 60 : (mode == 2) ? 100 : 25;
+            id(display_speed) = speed;
+            
+            auto call = id(purifier_fan).make_call();
+            call.set_speed(speed);
+            call.perform();
+        
+        # Sync web UI dropdown with hardware mode
+        - select.set:
+            id: purifier_mode_select
+            option: !lambda |-
+              const char* mode_names[] = {"QUIET", "NORMAL", "MAX", "AUTO"};
+              return mode_names[id(mode_index)];
+
+#================================================================================
+# END OF CONFIGURATION
+#================================================================================
+
+

@@ -18,21 +18,20 @@ logger:
 
 api:
 
-ota:
-
 wifi:
-  ssid: "Archer C20"
-  password: "ghanta@786"
+  ssid: "<your_wifi_ssid>"
+  password: "<your_wifi_password>"
 
   ap:
     ssid: "Dotpwm Fallback"
     password: "82jNkVOU8RN1"
 
-
-captive_portal:
-
 web_server:
   port: 80
+
+ota:
+  - platform: esphome
+    password: "<your_ota_password>"
 
 esp32_ble_server:
 
@@ -146,6 +145,8 @@ text_sensor:
       char buffer[16];
       snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", h, m, s);
       return std::string(buffer);
+
+
 # -------- WIFI INFO (CORRECT WAY) --------
   - platform: wifi_info
     ip_address:
