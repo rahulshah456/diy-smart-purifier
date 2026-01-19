@@ -102,24 +102,30 @@ wifi:
   on_connect:
     then:
       - lambda: |-
+          // Extract last digit from configured SSID (hardcoded as fallback)
+          // For dynamic SSID, use the last octet of IP address instead
           auto addresses = wifi::global_wifi_component->get_ip_addresses();
           if (!addresses.empty()) {
-            id(display_wifi_ip) = addresses[0].str();
-          } else {
-            id(display_wifi_ip) = "Connecting...";
+            std::string ip_str = addresses[0].str();
+            // Get last digit of IP (last octet)
+            size_t last_dot = ip_str.find_last_of('.');
+            if (last_dot != std::string::npos) {
+              id(display_wifi_last_digit) = ip_str.substr(last_dot + 1);
+            }
           }
-          ESP_LOGI("WIFI", "✓ Connected: %s", id(display_wifi_ip).c_str());
+          ESP_LOGI("WIFI", "✓ Connected");
   
   on_disconnect:
     then:
       - lambda: |-
-          id(display_wifi_ip) = "Connecting...";
+          id(display_wifi_last_digit) = "?";
           ESP_LOGI("WIFI", "✗ Disconnected");
 
 web_server:
   port: 80
 
 api:
+  reboot_timeout: 0s  # Disable auto-reboot when no API client is connected
 
 ota:
   platform: esphome
@@ -166,10 +172,20 @@ globals:
     type: float
     initial_value: '0.0'
   
-  # WiFi status for display (IP or "Connecting...")
-  - id: display_wifi_ip
+  # Latest PM10 reading
+  - id: display_pm10
+    type: float
+    initial_value: '0.0'
+  
+  # Indian AQI value (0-999)
+  - id: aqi_value
+    type: int
+    initial_value: '0'
+  
+  # WiFi SSID last digit (for compact display)
+  - id: display_wifi_last_digit
     type: std::string
-    initial_value: '"Connecting..."'
+    initial_value: '"0"'
   
   # Air quality status (Good/Fair/Moderate/Poor/Very Poor/Severe)
   - id: aqi_status
@@ -180,6 +196,66 @@ globals:
   - id: aqi_led_on
     type: bool
     initial_value: 'true'
+
+script:
+  - id: calculate_aqi
+    parameters:
+      pm25: float
+      pm10: float
+    then:
+      - lambda: |-
+          // Calculate Indian CPCB AQI for PM2.5
+          int aqi_pm25 = 0;
+          if (pm25 <= 30) 
+            aqi_pm25 = 0 + ((pm25 - 0) / (30 - 0)) * (50 - 0);
+          else if (pm25 <= 60) 
+            aqi_pm25 = 51 + ((pm25 - 31) / (60 - 31)) * (100 - 51);
+          else if (pm25 <= 90) 
+            aqi_pm25 = 101 + ((pm25 - 61) / (90 - 61)) * (200 - 101);
+          else if (pm25 <= 120) 
+            aqi_pm25 = 201 + ((pm25 - 91) / (120 - 91)) * (300 - 201);
+          else if (pm25 <= 250) 
+            aqi_pm25 = 301 + ((pm25 - 121) / (250 - 121)) * (400 - 301);
+          else 
+            aqi_pm25 = 401 + ((pm25 - 251) / (500 - 251)) * (500 - 401);
+
+          // Calculate Indian CPCB AQI for PM10
+          int aqi_pm10 = 0;
+          if (pm10 <= 50) 
+            aqi_pm10 = 0 + ((pm10 - 0) / (50 - 0)) * (50 - 0);
+          else if (pm10 <= 100) 
+            aqi_pm10 = 51 + ((pm10 - 51) / (100 - 51)) * (100 - 51);
+          else if (pm10 <= 250) 
+            aqi_pm10 = 101 + ((pm10 - 101) / (250 - 101)) * (200 - 101);
+          else if (pm10 <= 350) 
+            aqi_pm10 = 201 + ((pm10 - 251) / (350 - 251)) * (300 - 201);
+          else if (pm10 <= 430) 
+            aqi_pm10 = 301 + ((pm10 - 351) / (430 - 351)) * (400 - 301);
+          else 
+            aqi_pm10 = 401 + ((pm10 - 431) / (500 - 431)) * (500 - 401);
+          
+          // Take the maximum (worst case)
+          int aqi = (aqi_pm25 > aqi_pm10) ? aqi_pm25 : aqi_pm10;
+          id(aqi_value) = aqi;
+          ESP_LOGI("AQI", "Indian AQI: %d (PM2.5: %d, PM10: %d)", aqi, aqi_pm25, aqi_pm10);
+          
+          // Update AQI status
+          if (aqi <= 50) id(aqi_status) = "Good";
+          else if (aqi <= 100) id(aqi_status) = "Fair";
+          else if (aqi <= 200) id(aqi_status) = "Moderate";
+          else if (aqi <= 300) id(aqi_status) = "Poor";
+          else if (aqi <= 400) id(aqi_status) = "Very Poor";
+          else id(aqi_status) = "Severe";
+          
+          // Update LED color based on AQI levels
+          auto c = Color(0,255,0);  // Default: Green (Good)
+          if (aqi > 50) c = Color(0,255,255);    // Cyan (Fair)
+          if (aqi > 100) c = Color(255,255,0);   // Yellow (Moderate)
+          if (aqi > 200) c = Color(255,165,0);   // Orange (Poor)
+          if (aqi > 300) c = Color(255,0,0);     // Red (Very Poor)
+          if (aqi > 400) c = Color(139,0,0);     // Dark Red (Severe)
+          
+          id(aqi_led).turn_on().set_rgb(c.red/255.0, c.green/255.0, c.blue/255.0);
 
 #================================================================================
 # UART COMMUNICATION - PMS9003M Particle Sensor
@@ -237,57 +313,36 @@ sensor:
       on_value:
         then:
           - lambda: |-
-              float pm = x;
-              id(display_pm25) = pm;
-              ESP_LOGI("PM25", "PM2.5=%.1f ug/m3", pm);
-              
+              id(display_pm25) = x;
+              ESP_LOGI("PM25", "PM2.5=%.1f ug/m3", x);
+          - script.execute:
+              id: calculate_aqi
+              pm25: !lambda 'return id(display_pm25);'
+              pm10: !lambda 'return id(display_pm10);'
+          - lambda: |-
               // Only apply AUTO mode logic if in AUTO mode (mode_index == 3)
               if (id(mode_index) != 3) return;
               
-              // Calculate fan speed based on PM2.5 levels (AUTO mode)
+              int aqi = id(aqi_value);
+              
+              // Calculate fan speed based on AQI (AUTO mode)
               int speed = 10;
-              if (pm <= 3) speed = 10;
-              else if (pm <= 6) speed = 20;
-              else if (pm <= 9) speed = 30;
-              else if (pm <= 18) speed = 40;
-              else if (pm <= 30) speed = 55;
-              else if (pm <= 40) speed = 70;
-              else if (pm <= 54) speed = 85;
-              else if (pm <= 75) speed = 90;
-              else if (pm <= 99) speed = 95;
+              if (aqi <= 50) speed = 10;
+              else if (aqi <= 100) speed = 20;
+              else if (aqi <= 150) speed = 40;
+              else if (aqi <= 200) speed = 55;
+              else if (aqi <= 250) speed = 70;
+              else if (aqi <= 300) speed = 85;
+              else if (aqi <= 350) speed = 90;
               else speed = 100;
               
               id(display_speed) = speed;
-              ESP_LOGI("AUTO", "PM2.5=%.1f → Auto Fan Speed: %d%%", pm, speed);
+              ESP_LOGI("AUTO", "AQI %d → Auto Fan Speed: %d%%", aqi, speed);
               
               // Apply fan speed
               auto call = id(purifier_fan).make_call();
               call.set_speed(speed);
               call.perform();
-              
-              // Update LED color based on PM2.5 levels
-              auto c = Color(0,255,0);  // Default: Green (Good)
-              if (pm > 6) c = Color(0,255,255);    // Cyan (Fair)
-              if (pm > 9) c = Color(255,255,0);    // Yellow (Moderate)
-              if (pm > 18) c = Color(255,165,0);   // Orange (Unhealthy for Sensitive)
-              if (pm > 30) c = Color(255,0,0);     // Red (Unhealthy)
-              if (pm > 54) c = Color(139,0,0);     // Dark Red (Very Unhealthy)
-              if (pm > 75) c = Color(128,0,128);   // Purple (Hazardous)
-              if (pm > 99) c = Color(255,20,147);  // Pink (Emergency)
-              
-              id(aqi_led).turn_on().set_rgb(c.red/255.0, c.green/255.0, c.blue/255.0);
-              
-              // Set AQI Status text
-              if (pm <= 3) id(aqi_status) = "Good";
-              else if (pm <= 6) id(aqi_status) = "Good";
-              else if (pm <= 9) id(aqi_status) = "Fair";
-              else if (pm <= 18) id(aqi_status) = "Fair";
-              else if (pm <= 30) id(aqi_status) = "Moderate";
-              else if (pm <= 40) id(aqi_status) = "Moderate";
-              else if (pm <= 54) id(aqi_status) = "Poor";
-              else if (pm <= 75) id(aqi_status) = "Poor";
-              else if (pm <= 99) id(aqi_status) = "Very Poor";
-              else id(aqi_status) = "Severe";
     
     # PM10.0 - Particulate Matter 10.0 microns
     pm_10_0:
@@ -296,7 +351,12 @@ sensor:
       on_value:
         then:
           - lambda: |-
+              id(display_pm10) = x;
               ESP_LOGI("PM100", "PM10.0=%.1f ug/m3", x);
+          - script.execute:
+              id: calculate_aqi
+              pm25: !lambda 'return id(display_pm25);'
+              pm10: !lambda 'return id(display_pm10);'
     
     # Particle Count sensors (0.3μm to 10.0μm)
     pm_0_3um:
@@ -398,6 +458,11 @@ font:
   - file: "gfonts://Roboto"
     id: font_small
     size: 10
+  
+  - file: "roboto-bold.ttf"
+    id: font_large_bold
+    size: 55
+    glyphs: "0123456789"
 
 display:
   - platform: ssd1306_i2c
@@ -408,26 +473,27 @@ display:
     lambda: |-
       it.fill(Color::BLACK);
       
-      // Line 0: Uptime (HH:MM:SS)
-      it.printf(0, 0, id(font_small), "Up Time: %02d:%02d:%02d", 
-        id(display_uptime_hours), id(display_uptime_minutes), id(display_uptime_seconds));
+      // Left side: Compact info (left aligned, starting at x=0)
+      // Line 1: Mode (full text: QUIET / NORMAL / MAX / AUTO)
+      it.printf(0, 0, id(font_small), "%s", id(display_mode).c_str());
       
-      // Line 1: Current mode
-      it.printf(0, 12, id(font_small), "Mode: %s", id(display_mode).c_str());
+      // Line 2: Fan speed (3 digits with %)
+      it.printf(0, 12, id(font_small), "%d%%", id(display_speed));
       
-      // Line 2: Fan speed and RPM
-      if (id(fan_rpm).has_state()) {
-        it.printf(0, 24, id(font_small), "Speed: %d%%  |  %.0f RPM", 
-          id(display_speed), id(fan_rpm).state);
-      } else {
-        it.printf(0, 24, id(font_small), "Speed: %d%%  |  -- RPM", id(display_speed));
-      }
+      // Line 3: PM2.5 value only
+      it.printf(0, 24, id(font_small), "%.0f ug", id(display_pm25));
       
-      // Line 3: PM2.5 air quality
-      it.printf(0, 36, id(font_small), "PM25: %.0f ug/m3", id(display_pm25));
+      // Line 4: WiFi last digit with prefix (IP.7 for last octet)
+      it.printf(0, 36, id(font_small), "IP.%s", id(display_wifi_last_digit).c_str());
       
-      // Line 4: WiFi IP address
-      it.printf(0, 48, id(font_small), "WIFI: %s", id(display_wifi_ip).c_str());
+      // Line 5: Uptime in minutes only
+      uint32_t total_minutes = id(display_uptime_hours) * 60 + id(display_uptime_minutes);
+      it.printf(0, 48, id(font_small), "%dm", total_minutes);
+      
+      // Right side: Large bold AQI value (right aligned at x=128, vertically centered)
+      // Show only necessary digits (10, 32, 125, 999) without leading zeros
+      int aqi = id(aqi_value);
+      it.printf(128, 5, id(font_large_bold), TextAlign::RIGHT, "%d", aqi);
 
 #================================================================================
 # CONTROL INTERFACE - Mode Selection (Web UI Dropdown)
@@ -489,6 +555,41 @@ switch:
           id(aqi_led_on) = false;
           ESP_LOGI("LED", "LED strip: OFF");
       - light.turn_off: aqi_led
+
+#================================================================================
+# NUMBER - Fan Speed Slider Control
+#================================================================================
+
+number:
+  - platform: template
+    name: "Fan Speed"
+    id: fan_speed_slider
+    min_value: 10
+    max_value: 100
+    step: 5
+    mode: slider
+    unit_of_measurement: "%"
+    lambda: |-
+      return id(display_speed);
+    set_action:
+      - lambda: |-
+          int speed = x;
+          
+          // Check if in AUTO mode - warn and switch to NORMAL mode
+          if (id(mode_index) == 3) {
+            ESP_LOGW("FAN", "Manual speed change while in AUTO mode - switching to NORMAL mode");
+            id(mode_index) = 1;  // Switch to NORMAL mode
+            id(display_mode) = "NORMAL";
+          }
+          
+          // Update global speed variable
+          id(display_speed) = speed;
+          ESP_LOGI("FAN", "Manual speed adjustment → %d%%", speed);
+          
+          // Apply fan speed
+          auto call = id(purifier_fan).make_call();
+          call.set_speed(speed);
+          call.perform();
 
 #================================================================================
 # TEXT SENSORS - Status Display (Web UI)
